@@ -204,6 +204,7 @@ input[type=range]::-moz-range-thumb{width:15px;height:15px;border:none;border-ra
 .seqhead{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
 .toggle.seqplay.on{background:var(--rec);border-color:var(--rec);color:#fff;box-shadow:0 0 14px color-mix(in srgb,var(--rec) 40%,transparent)}
 #seqrec.on{background:var(--rec);border-color:var(--rec);color:#fff}
+#seqmute.on{background:var(--rec);border-color:var(--rec);color:#fff;box-shadow:none}
 .seqgrid{display:grid;grid-template-columns:repeat(16,1fr);gap:5px}
 .seqgrid .step{position:relative;aspect-ratio:1/1.25;background:var(--panel-2);border:1px solid var(--line);border-radius:7px;display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:4px 2px;cursor:pointer;transition:.08s;overflow:hidden}
 .seqgrid .step.beat{border-color:color-mix(in srgb,var(--muted) 40%,var(--line))}
@@ -335,8 +336,8 @@ input[type=range]::-moz-range-thumb{width:15px;height:15px;border:none;border-ra
       <button class="starbtn" id="starbtn" title="Marcar en biblioteca">★</button>
       <span class="badge" id="trackinfo">Sin track</span>
       <span class="engchip" id="engchip">MOTOR YT</span>
-      <div class="ctl-group" title="Volumen del video de YouTube">
-        <span class="lbl">vid</span>
+      <div class="ctl-group" title="Volumen de salida (master / video)">
+        <span class="lbl">vol</span>
         <input type="range" id="ytvol" min="0" max="100" step="1" value="100" style="width:80px">
         <span class="val" id="ytvolval">100</span>
       </div>
@@ -497,6 +498,7 @@ input[type=range]::-moz-range-thumb{width:15px;height:15px;border:none;border-ra
         <button class="toggle seqplay" id="seqplay">▶ PLAY</button>
         <button class="toggle" id="seqrec">● REC</button>
         <button class="toggle on" id="seqgate">GATE</button>
+        <button class="toggle" id="seqmute">MUTE</button>
         <div class="ctl-group"><span class="lbl">steps</span>
           <div class="seg" id="seqlen"><button data-len="8">8</button><button data-len="16" class="on">16</button></div>
         </div>
@@ -687,7 +689,7 @@ function cssVar(n){return getComputedStyle(document.body).getPropertyValue(n).tr
 function ensureAC(){
   if(AC){if(AC.state==='suspended')AC.resume();return;}
   AC=new (window.AudioContext||window.webkitAudioContext)();
-  master=AC.createGain();
+  master=AC.createGain();master.gain.value=ytVol/100;
   analyser=AC.createAnalyser();analyser.fftSize=2048;analyser.smoothingTimeConstant=.78;
   splitter=AC.createChannelSplitter(2);
   anL=AC.createAnalyser();anL.fftSize=1024;anR=AC.createAnalyser();anR.fftSize=1024;
@@ -999,19 +1001,42 @@ function onTrackChanged(){
   if(s){s.dur=duration;if(s.grid)setBpmVal(s.grid.bpm);else if(s.bpm)setBpmVal(Math.round(s.bpm));}
   if(hist[0]?.id!==currentVideo){hist.unshift({id:currentVideo,t:Date.now()});saveHist();}
   adoptBuffer(currentVideo);
-  loop.active=false;closeEdit();stopSeq();loadSeqForSong();
+  loop.active=false;closeEdit();transportStop();loadSeqForSong();
   renderPads();renderPlaylist();updateGridInfo();updateTrackInfo();updateLCD();updateLCDTitle();updateStar();renderLibrary();drawRibbon();
   if(rate!==1)setTimeout(()=>{try{player.setPlaybackRate(nearestRate(rate));}catch(e){}},300);
   saveLib();
 }
 
 /* ════════ TRANSPORT / SCRUB ════════ */
+let transportOn=false, clickWanted=false, seqMuted=false;
+function seqHasSteps(){return seq.steps.slice(0,seq.len).some(s=>s.cells.length);}
 function togglePlay(){
   if(!currentVideo)return;
   if(frz){stopFreeze(true);return;}
-  if(bufActive()){playing?pauseEngine():resumeEngine();return;}
-  const st2=player.getPlayerState();
-  if(st2===YT.PlayerState.PLAYING)player.pauseVideo();else player.playVideo();
+  transportOn?transportStop():transportStart();
+}
+function transportStart(){
+  ensureAC();
+  xportStart=AC.currentTime+0.12;                 // shared phase origin
+  if(seqHasSteps()){startSeqClocked();}           // pattern loops...
+  else{ if(bufActive())resumeEngine(); else if(ytReady)player.playVideo(); } // ...or linear playback
+  if(clickWanted)startClickClocked();             // click only sounds with transport
+  startMidiClock();
+  transportOn=true;updateTransportUI();
+}
+function transportStop(){
+  transportOn=false;
+  if(bufActive())pauseEngine(); else if(ytReady)player.pauseVideo();
+  stopSeqInternal();
+  stopClick();
+  stopMidiClock();
+  if(AC)chokeSeqVoices(AC.currentTime);
+  updateTransportUI();
+}
+function updateTransportUI(){
+  const b=document.getElementById('seqplay');
+  if(b){b.textContent=transportOn?'■ STOP':'▶ PLAY';b.classList.toggle('on',transportOn);}
+  document.getElementById('lcdState').textContent=frz?'❄':(transportOn?'▶':'❚❚');
 }
 let scrubAccum=0,scrubRAF=null;
 const frame=document.getElementById('frame');
@@ -1194,7 +1219,7 @@ function updatePlayhead(t){
   document.getElementById('tcur').textContent=fmt(t);
   document.getElementById('lcdTime').textContent=fmt(t);
   const ps=document.getElementById('lcdState');
-  const isPlaying=bufActive()?playing:(ytReady&&player.getPlayerState&&player.getPlayerState()===1);
+  const isPlaying=transportOn||(bufActive()?playing:(ytReady&&player.getPlayerState&&player.getPlayerState()===1));
   ps.textContent=frz?'❄':(isPlaying?'▶':'❚❚');
 }
 
@@ -1425,19 +1450,15 @@ function slice(){
 let seqRec=false;
 seq.curPlaying=0;
 function seqStepDur(){return seq.div*60/bpm;}
-function startSeq(){
+function startSeqClocked(){
   if(!bufActive())toast('El sequencer suena pleno con motor BUFFER — capturá el audio');
   ensureAC();
-  xportStart=AC.currentTime+0.1;                 // shared phase origin for seq + click
   seq.on=true;seq.stepIx=0;seq.curPlaying=0;seq.nextT=xportStart;
   clearInterval(seq.sched);seq.sched=setInterval(seqScheduler,25);
-  const b=document.getElementById('seqplay');b.textContent='■ STOP';b.classList.add('on');
-  if(clickOn){clearInterval(clickSched);alignClickToTransport();clickSched=setInterval(clickScheduler,25);} // lock click to step grid
-  startMidiClock();
 }
-function stopSeq(){seq.on=false;clearInterval(seq.sched);const b=document.getElementById('seqplay');b.textContent='▶ PLAY';b.classList.remove('on');highlightStep(-1);stopMidiClock();if(AC)chokeSeqVoices(AC.currentTime);}
-function toggleSeqGate(){seqGate=!seqGate;document.getElementById('seqgate').classList.toggle('on',seqGate);toast(seqGate?'GATE on — cada step corta al anterior':'GATE off — los steps se superponen');}
-function toggleSeq(){seq.on?stopSeq():startSeq();}
+function stopSeqInternal(){seq.on=false;clearInterval(seq.sched);highlightStep(-1);if(AC)chokeSeqVoices(AC.currentTime);}
+function toggleSeq(){togglePlay();}        // sequencer PLAY button = master transport
+function toggleSeqGate(){seqGate=!seqGate;document.getElementById('seqgate').classList.toggle('on',seqGate);toast(seqGate?'GATE on — el trigger suena hasta el próximo':'GATE off — los steps se superponen');}
 function seqScheduler(){
   while(seq.nextT<AC.currentTime+0.12){
     fireStep(seq.stepIx%seq.len, seq.nextT);
@@ -1448,13 +1469,14 @@ function seqScheduler(){
 function fireStep(ix,when){
   const song=curSong(), step=seq.steps[ix];
   const perfWhen=performance.now()+(when-AC.currentTime)*1000;
-  if(song&&step){
+  const hasCells=step&&step.cells.length>0;
+  if(song&&hasCells){
     if(bufActive()){
-      if(seqGate)chokeSeqVoices(when);                 // cut previous step → no pile-up
-      const gate=seqGate?seqStepDur()*0.97:0;          // each step rings ~1 step (Hold-style)
-      step.cells.forEach(({b,i})=>{const cue=song.banks[b]&&song.banks[b][i];if(cue)spawnSeqVoice(cue,when,gate);});
-    }
-    else if(step.cells[0]){const {b,i}=step.cells[0],cue=song.banks[b]&&song.banks[b][i];if(cue){const dl=Math.max(0,(when-AC.currentTime)*1000);setTimeout(()=>{player.seekTo(cue.time,true);player.playVideo();},dl);}}
+      if(!seqMuted){
+        if(seqGate)chokeSeqVoices(when);                 // cut the previous trigger right here
+        step.cells.forEach(({b,i})=>{const cue=song.banks[b]&&song.banks[b][i];if(cue)spawnSeqVoice(cue,when,0);}); // gate 0 = ring until next trigger
+      }
+    } else if(step.cells[0]&&!seqMuted){const {b,i}=step.cells[0],cue=song.banks[b]&&song.banks[b][i];if(cue){const dl=Math.max(0,(when-AC.currentTime)*1000);setTimeout(()=>{player.seekTo(cue.time,true);player.playVideo();},dl);}}
     step.cells.forEach(({b,i})=>{const cue=song.banks[b]&&song.banks[b][i];if(cue&&midiOut){const note=clamp(midiBase+(b*PADS+i)+(cue.st||0),0,127);msend([0x90|midiCh,note,100],perfWhen);msend([0x80|midiCh,note,0],perfWhen+Math.min(150,seqStepDur()*900));}});
   }
   const dl=Math.max(0,(when-AC.currentTime)*1000);
@@ -1585,18 +1607,18 @@ function alignClickToTransport(){ // lock click beats to the sequencer's step gr
   clickBeat=Math.round((t-xportStart)/spb);
   clickNext=t;
 }
-function startClick(){
-  ensureAC();clickOn=true;
-  if(seq.on)alignClickToTransport();
-  else{clickBeat=0;clickNext=AC.currentTime+0.06;}
-  clickSched=setInterval(clickScheduler,25);
-  document.getElementById('clickbtn').classList.add('click-on');
+function startClickClocked(){ensureAC();clickOn=true;alignClickToTransport();clearInterval(clickSched);clickSched=setInterval(clickScheduler,25);}
+function stopClick(){clickOn=false;clearInterval(clickSched);}
+function toggleClick(){
+  clickWanted=!clickWanted;
+  document.getElementById('clickbtn').classList.toggle('click-on',clickWanted);
+  if(transportOn){clickWanted?startClickClocked():stopClick();}
+  else toast(clickWanted?'Click armado — suena al darle play':'Click off');
 }
-function stopClick(){clickOn=false;clearInterval(clickSched);document.getElementById('clickbtn').classList.remove('click-on');}
-function toggleClick(){clickOn?stopClick():startClick();}
 function setClickVol(v){clickVol=v;if(clickGain)clickGain.gain.value=clickVol;document.getElementById('clickvolval').textContent=Math.round(clickVol*100)+'%';saveSettings();}
 function setYtVol(v){
   ytVol=v;document.getElementById('ytvolval').textContent=v;
+  if(master)master.gain.value=v/100;                    // buffer engine: master output
   if(player){try{player.setVolume(v);if(!bufActive()){v>0?player.unMute():player.mute();}}catch(e){}}
   saveSettings();
 }
@@ -2020,6 +2042,7 @@ document.getElementById('midiclkbtn').addEventListener('click',toggleMidiClock);
 document.getElementById('seqplay').addEventListener('click',toggleSeq);
 document.getElementById('seqrec').addEventListener('click',toggleSeqRec);
 document.getElementById('seqgate').addEventListener('click',toggleSeqGate);
+document.getElementById('seqmute').addEventListener('click',()=>{seqMuted=!seqMuted;document.getElementById('seqmute').classList.toggle('on',seqMuted);if(seqMuted&&AC)chokeSeqVoices(AC.currentTime);toast(seqMuted?'Sequencer en MUTE (sigue el reloj y el MIDI)':'Sequencer audible');});
 document.getElementById('ribreset').addEventListener('click',e=>{e.stopPropagation();ribReset();});
 document.getElementById('ribstart').addEventListener('click',e=>{e.stopPropagation();ribGoStart();});
 document.querySelectorAll('#seqlen button').forEach(b=>b.addEventListener('click',()=>setSeqLen(+b.dataset.len)));
@@ -2055,7 +2078,7 @@ document.getElementById('scrubval').textContent=scrubSpeed.toFixed(2)+'s';
 document.getElementById('prevval').textContent=frzLen.toFixed(2)+'s';
 document.getElementById('pitchrange').value=st;
 document.getElementById('pitchval').textContent=(st>0?'+':'')+st+' st';
-setBpmVal(bpm);updatePitchInfo();renderPads();renderLibrary();drawRibbon();loadSeqForSong();
+setBpmVal(bpm);updatePitchInfo();renderPads();renderLibrary();drawRibbon();loadSeqForSong();updateTransportUI();
 document.getElementById('clickvolval').textContent=Math.round(clickVol*100)+'%';
 setInterval(()=>{if(visMode!=='video'&&!vizRAF)startViz();},800);
 if(location.protocol==='file:'){
