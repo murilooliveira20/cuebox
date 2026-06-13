@@ -627,12 +627,62 @@ let editSel=null;               // {b,i} selected cue in EDIT mode
 let noteHeld=null;              // key currently gating a chromatic note
 
 /* engine */
-let AC=null, master=null, analyser=null, anL=null, anR=null, splitter=null, recTap=null, zeroG=null, clickGain=null;
-const bufMap=new Map();
+let AC=null, master=null, analyser=null, anL=null, anR=null, splitter=null, zeroG=null, clickGain=null;
+let workletReady=false;
+
+/* ---- AudioWorklet processor code (runs in dedicated audio thread) ---- */
+const WORKLET_CODE=`
+class CollectorProcessor extends AudioWorkletProcessor {
+  constructor(options){
+    super();this._active=false;this._id=options.processorOptions.id;
+    this.port.onmessage=e=>{if(e.data==='start')this._active=true;if(e.data==='stop')this._active=false;};
+  }
+  process(inputs){
+    if(!this._active)return true;
+    const inp=inputs[0];if(!inp||!inp[0])return true;
+    const L=inp[0], R=inp[1]||inp[0];
+    this.port.postMessage({L:L.slice(),R:R.slice()});
+    return true;
+  }
+}
+registerProcessor('collector',CollectorProcessor);
+`;
+
+async function ensureAC(){
+  if(AC){if(AC.state==='suspended')await AC.resume();return;}
+  AC=new (window.AudioContext||window.webkitAudioContext)();
+  /* load worklet from blob URL so no external file needed */
+  const blob=new Blob([WORKLET_CODE],{type:'application/javascript'});
+  const burl=URL.createObjectURL(blob);
+  try{await AC.audioWorklet.addModule(burl);workletReady=true;}catch(e){console.warn('AudioWorklet failed, will use ScriptProcessor fallback',e);}
+  URL.revokeObjectURL(burl);
+  master=AC.createGain();master.gain.value=ytVol/100;
+  analyser=AC.createAnalyser();analyser.fftSize=2048;analyser.smoothingTimeConstant=.78;
+  splitter=AC.createChannelSplitter(2);
+  anL=AC.createAnalyser();anL.fftSize=1024;anR=AC.createAnalyser();anR.fftSize=1024;
+  zeroG=AC.createGain();zeroG.gain.value=0;
+  master.connect(analyser);analyser.connect(AC.destination);
+  master.connect(splitter);splitter.connect(anL,0);splitter.connect(anR,1);
+  /* bus recording: worklet node taps master */
+  if(workletReady){
+    busWorklet=new AudioWorkletNode(AC,'collector',{processorOptions:{id:'bus'},numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2]});
+    busWorklet.port.onmessage=ev=>{if(!busRec)return;const{L,R}=ev.data;recL.push(new Float32Array(L));recR.push(new Float32Array(R));recLen+=L.length;};
+    master.connect(busWorklet);busWorklet.connect(zeroG);
+  } else {
+    /* ScriptProcessor fallback for environments without worklet support */
+    const sp=AC.createScriptProcessor(2048,2,2);
+    sp.onaudioprocess=ev=>{if(!busRec)return;const l=ev.inputBuffer.getChannelData(0),r=ev.inputBuffer.numberOfChannels>1?ev.inputBuffer.getChannelData(1):l;recL.push(new Float32Array(l));recR.push(new Float32Array(r));recLen+=l.length;};
+    master.connect(sp);sp.connect(zeroG);
+  }
+  zeroG.connect(AC.destination);
+  clickGain=AC.createGain();clickGain.gain.value=clickVol;clickGain.connect(AC.destination);
+}
 let buf=null, capOff=0, peaks=null;     // peaks: {bs,min,max} pyramid (mono)
 let voice=null, playing=false, anchorT=0, anchorPos=0, loopWin=null, vRate=1;
 const polyVoices=new Set();             // one-shot poly voices (don't touch transport)
 const seqVoices=new Set();              // sequencer voices (choked each step)
+const bufMap=new Map();
+let busWorklet=null;
 let clickVol=0.5;
 let seqGate=true;                       // true = each step chokes previous (Hold-style)
 let xportStart=0;                       // shared transport phase (AC time of beat 0)
@@ -686,25 +736,7 @@ function playheadTime(){return frz?frzPoint:pos();}
 function cssVar(n){return getComputedStyle(document.body).getPropertyValue(n).trim();}
 
 /* ════════ AUDIO CORE ════════ */
-function ensureAC(){
-  if(AC){if(AC.state==='suspended')AC.resume();return;}
-  AC=new (window.AudioContext||window.webkitAudioContext)();
-  master=AC.createGain();master.gain.value=ytVol/100;
-  analyser=AC.createAnalyser();analyser.fftSize=2048;analyser.smoothingTimeConstant=.78;
-  splitter=AC.createChannelSplitter(2);
-  anL=AC.createAnalyser();anL.fftSize=1024;anR=AC.createAnalyser();anR.fftSize=1024;
-  zeroG=AC.createGain();zeroG.gain.value=0;
-  recTap=AC.createScriptProcessor(4096,2,2);
-  master.connect(analyser);analyser.connect(AC.destination);
-  master.connect(splitter);splitter.connect(anL,0);splitter.connect(anR,1);
-  master.connect(recTap);recTap.connect(zeroG);zeroG.connect(AC.destination);
-  recTap.onaudioprocess=ev=>{
-    if(!busRec)return;
-    const l=ev.inputBuffer.getChannelData(0), r=ev.inputBuffer.numberOfChannels>1?ev.inputBuffer.getChannelData(1):l;
-    recL.push(new Float32Array(l));recR.push(new Float32Array(r));recLen+=l.length;
-  };
-  clickGain=AC.createGain();clickGain.gain.value=clickVol;clickGain.connect(AC.destination);
-}
+
 function makeFilter(f){ // f in [-1,1]; <0 lowpass, >0 highpass, ~0 bypass(null)
   if(Math.abs(f)<0.03)return null;
   const bq=AC.createBiquadFilter();
@@ -810,34 +842,49 @@ function adoptBuffer(id){
 }
 
 /* ════════ CAPTURE ════════ */
-let capturing=false, capRolling=false, capStream=null, capSrc=null, capProc=null;
+let capturing=false, capRolling=false, capStream=null, capSrc=null, capNode=null;
 let capL=[],capR=[],capLen2=0,capOffP=null;
 async function startCapture(){
   if(!currentVideo){toast('Cargá un video primero');return;}
   if(capturing){finishCapture();return;}
-  ensureAC();stopClick();stopVoice();if(frz)stopFreeze(false);
-  try{capStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});}
+  await ensureAC();stopVoice();if(frz)stopFreeze(false);
+  try{capStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:AC.sampleRate}});}
   catch(e){toast('Captura cancelada');return;}
   if(!capStream.getAudioTracks().length){toast('Sin audio: marcá "Compartir audio de la pestaña"');capStream.getTracks().forEach(t=>t.stop());return;}
   capStream.getVideoTracks().forEach(t=>t.stop());
   capSrc=AC.createMediaStreamSource(capStream);
-  capProc=AC.createScriptProcessor(4096,2,2);
   capL=[];capR=[];capLen2=0;capOffP=null;capRolling=false;
-  capProc.onaudioprocess=ev=>{
-    if(!capturing||!capRolling)return;
-    if(capOffP===null){try{capOffP=player.getCurrentTime()||0;}catch(e){capOffP=0;}}
-    const l=ev.inputBuffer.getChannelData(0), r=ev.inputBuffer.numberOfChannels>1?ev.inputBuffer.getChannelData(1):l;
-    capL.push(new Float32Array(l));capR.push(new Float32Array(r));capLen2+=l.length;
-    const p=duration?clamp(player.getCurrentTime()/duration*100,0,100):0;
-    document.getElementById('capfill').style.width=p+'%';
-  };
-  capSrc.connect(capProc);capProc.connect(zeroG);
+  if(workletReady){
+    capNode=new AudioWorkletNode(AC,'collector',{processorOptions:{id:'cap'},numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2]});
+    capNode.port.onmessage=ev=>{
+      if(!capturing||!capRolling)return;
+      if(capOffP===null){try{capOffP=player.getCurrentTime()||0;}catch(e){capOffP=0;}}
+      const{L,R}=ev.data;
+      capL.push(new Float32Array(L));capR.push(new Float32Array(R));capLen2+=L.length;
+      const p=duration?clamp(capLen2/(duration*AC.sampleRate)*100,0,100):0;
+      document.getElementById('capfill').style.width=p+'%';
+    };
+    capNode.port.postMessage('start');
+    capSrc.connect(capNode);capNode.connect(zeroG);
+  } else {
+    capNode=AC.createScriptProcessor(2048,2,2);
+    capNode.onaudioprocess=ev=>{
+      if(!capturing||!capRolling)return;
+      if(capOffP===null){try{capOffP=player.getCurrentTime()||0;}catch(e){capOffP=0;}}
+      const l=ev.inputBuffer.getChannelData(0),r=ev.inputBuffer.numberOfChannels>1?ev.inputBuffer.getChannelData(1):l;
+      capL.push(new Float32Array(l));capR.push(new Float32Array(r));capLen2+=l.length;
+      const p=duration?clamp(capLen2/(duration*AC.sampleRate)*100,0,100):0;
+      document.getElementById('capfill').style.width=p+'%';
+    };
+    capSrc.connect(capNode);capNode.connect(zeroG);
+  }
   capturing=true;
   try{player.unMute();player.setPlaybackRate(1);player.seekTo(0,true);player.playVideo();}catch(e){}
   const b=document.getElementById('capbtn');b.classList.add('busy');b.textContent='■ CAPTURANDO… (click p/ parar)';
   document.getElementById('capprog').style.display='block';
   capStream.getAudioTracks()[0].onended=()=>{if(capturing)finishCapture();};
-  toast('Capturando el track completo a 1× — esperá al final o pará cuando quieras');
+  const eng=workletReady?'AudioWorklet':'ScriptProcessor';
+  toast('Capturando a 1× ['+eng+'] — esperá al final o pará cuando quieras');
 }
 function buildPeaks(buffer){
   const bs=512, c0=buffer.getChannelData(0), c1=buffer.numberOfChannels>1?buffer.getChannelData(1):c0;
@@ -851,7 +898,7 @@ function buildPeaks(buffer){
 }
 function finishCapture(){
   capturing=false;capRolling=false;
-  try{capProc.disconnect();capSrc.disconnect();}catch(e){}
+  if(capNode){if(workletReady)try{capNode.port.postMessage('stop');}catch(e){}try{capNode.disconnect();capSrc.disconnect();}catch(e){}}
   if(capStream)capStream.getTracks().forEach(t=>t.stop());
   const b=document.getElementById('capbtn');b.classList.remove('busy');
   document.getElementById('capprog').style.display='none';
@@ -1936,7 +1983,7 @@ async function startRec(){
   tabStream.getVideoTracks().forEach(t=>t.stop());
   tabCtx=new (window.AudioContext||window.webkitAudioContext)();tabSR=tabCtx.sampleRate;
   tabSrc=tabCtx.createMediaStreamSource(tabStream);
-  tabProc=tabCtx.createScriptProcessor(4096,2,2);
+  tabProc=tabCtx.createScriptProcessor(2048,2,2);
   recL=[];recR=[];recLen=0;
   tabProc.onaudioprocess=ev=>{if(!tabRec)return;const l=ev.inputBuffer.getChannelData(0),r=ev.inputBuffer.numberOfChannels>1?ev.inputBuffer.getChannelData(1):l;recL.push(new Float32Array(l));recR.push(new Float32Array(r));recLen+=l.length;};
   tabSilent=tabCtx.createGain();tabSilent.gain.value=0;
