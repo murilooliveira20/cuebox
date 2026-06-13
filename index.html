@@ -666,7 +666,7 @@ async function ensureAC(){
   /* bus recording: worklet node taps master */
   if(workletReady){
     busWorklet=new AudioWorkletNode(AC,'collector',{processorOptions:{id:'bus'},numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2]});
-    busWorklet.port.onmessage=ev=>{if(!busRec)return;const{L,R}=ev.data;recL.push(new Float32Array(L));recR.push(new Float32Array(R));recLen+=L.length;};
+    busWorklet.port.onmessage=ev=>{const{L,R}=ev.data;recL.push(new Float32Array(L));recR.push(new Float32Array(R));recLen+=L.length;};
     master.connect(busWorklet);busWorklet.connect(zeroG);
   } else {
     /* ScriptProcessor fallback for environments without worklet support */
@@ -1976,7 +1976,11 @@ let tabRec=false, tabStream=null, tabSrc=null, tabProc=null, tabSilent=null, tab
 const recBtn=document.getElementById('recbtn');
 recBtn.addEventListener('click',()=>{(busRec||tabRec)?stopRec():startRec();});
 async function startRec(){
-  if(bufActive()){ensureAC();recL=[];recR=[];recLen=0;busRec=true;armRecUI();toast('Grabando tu performance (sin click)');return;}
+  if(bufActive()){
+    await ensureAC();recL=[];recR=[];recLen=0;busRec=true;
+    if(busWorklet)busWorklet.port.postMessage('start');
+    armRecUI();toast('Grabando tu performance (sin click)');return;
+  }
   try{tabStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});}
   catch(e){toast('Captura cancelada');return;}
   if(!tabStream.getAudioTracks().length){toast('Sin audio: marcá "Compartir audio de la pestaña"');tabStream.getTracks().forEach(t=>t.stop());return;}
@@ -2001,6 +2005,7 @@ function armRecUI(){
 function stopRec(){
   const sr2=busRec?(AC?AC.sampleRate:48000):tabSR;
   busRec=false;
+  if(busWorklet)try{busWorklet.port.postMessage('stop');}catch(e){}
   if(tabRec){tabRec=false;try{tabProc.disconnect();tabSrc.disconnect();tabSilent.disconnect();}catch(e){}if(tabStream)tabStream.getTracks().forEach(t=>t.stop());if(tabCtx)tabCtx.close();}
   clearInterval(recTimer);
   recBtn.classList.remove('armed');document.getElementById('reclabel').textContent='Grabar WAV';
